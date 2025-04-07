@@ -64,9 +64,8 @@ impl SqliteStore {
 
 impl IsStore for SqliteStore {
     type Error = Error;
-
+    type Lock<'a> = async_lock::MutexGuard<'a, sqlite::Connection>;
     type StoreValue = JsonSerialized;
-
     type DeserializedValue<T> = JsonDeserialized<T>;
 
     fn construct_deserialized<T>(value: T) -> Self::DeserializedValue<T> {
@@ -77,8 +76,8 @@ impl IsStore for SqliteStore {
         value.0
     }
 
-    fn fetch_serialized_by_key<'a>(
-        &'a self,
+    fn fetch_serialized_by_key<'a, 'l: 'a>(
+        lock: &'a Self::Lock<'l>,
         key: &'a [impl AsRef<str>],
     ) -> crate::Stored<'a, Option<Self::StoreValue>, Self::Error> {
         let key: String = key
@@ -88,9 +87,8 @@ impl IsStore for SqliteStore {
             .join(" ");
         Box::pin(async move {
             log::trace!("fetching {key}");
-            let guard = self.connection.lock().await;
             let query = "SELECT value FROM potency WHERE key = :key";
-            let mut statement = guard.prepare(query)?;
+            let mut statement = lock.prepare(query)?;
             statement.bind((":key", key.as_str()))?;
             match statement.next()? {
                 sqlite::State::Row => {
@@ -104,8 +102,8 @@ impl IsStore for SqliteStore {
         })
     }
 
-    fn store_serialized_by_key<'a>(
-        &'a self,
+    fn store_serialized_by_key<'a, 'l: 'a>(
+        lock: &'a mut Self::Lock<'l>,
         key: &'a [impl AsRef<str>],
         serialized_value: Self::StoreValue,
     ) -> crate::Stored<'a, (), Self::Error> {
@@ -118,9 +116,8 @@ impl IsStore for SqliteStore {
             // UNWRAP: safe because we know `Value` always serializes.
             let value = serde_json::to_string(&serialized_value.0).unwrap();
             log::trace!("storing key {key}: {value}");
-            let guard = self.connection.lock().await;
             let query = "INSERT INTO potency (key, value) VALUES (:key, :value)";
-            let mut statement = guard.prepare(query)?;
+            let mut statement = lock.prepare(query)?;
             statement.bind(&[(":key", key.as_str()), (":value", value.as_str())][..])?;
             match statement.next()? {
                 sqlite::State::Row => {
@@ -132,6 +129,12 @@ impl IsStore for SqliteStore {
             }
             Ok(())
         })
+    }
+
+    fn lock<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Self::Lock<'a>> + 'a>> {
+        Box::pin(async { self.connection.lock().await })
     }
 }
 

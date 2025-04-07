@@ -6,10 +6,10 @@
 
 use std::{future::Future, marker::PhantomData, pin::Pin};
 
-#[cfg(feature = "json")]
-pub mod json;
 #[cfg(feature = "cpu-store")]
 pub mod cpu_store;
+#[cfg(feature = "json")]
+pub mod json;
 #[cfg(feature = "sqlite-store")]
 pub mod sqlite_store;
 
@@ -31,19 +31,22 @@ pub type Stored<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + 'a>>;
 
 pub trait IsStore: Clone {
     type Error;
+    type Lock<'a>;
     type StoreValue;
     type DeserializedValue<T>;
 
     fn construct_deserialized<T>(value: T) -> Self::DeserializedValue<T>;
     fn extract_deserialized<T>(value: Self::DeserializedValue<T>) -> T;
 
-    fn fetch_serialized_by_key<'a>(
-        &'a self,
+    fn lock<'a>(&'a self) -> Pin<Box<dyn Future<Output = Self::Lock<'a>> + 'a>>;
+
+    fn fetch_serialized_by_key<'a, 'l: 'a>(
+        lock: &'a Self::Lock<'l>,
         key: &'a [impl AsRef<str>],
     ) -> Stored<'a, Option<Self::StoreValue>, Self::Error>;
 
-    fn store_serialized_by_key<'a>(
-        &'a self,
+    fn store_serialized_by_key<'a, 'l: 'a>(
+        lock: &'a mut Self::Lock<'l>,
         key: &'a [impl AsRef<str>],
         serialized_value: Self::StoreValue,
     ) -> Stored<'a, (), Self::Error>;
@@ -177,8 +180,9 @@ where
         let mut full_key = self.key.clone();
         full_key.extend(key.iter().map(|k| k.as_ref().to_string()));
         Box::pin(async move {
+            let mut lock = self.inner.lock().await;
             let maybe_serialized_value: Option<S::StoreValue> =
-                self.inner.fetch_serialized_by_key(&full_key).await?;
+                S::fetch_serialized_by_key(&lock, &full_key).await?;
             if let Some(serialized) = maybe_serialized_value {
                 log::trace!("{full_key:?} is cached, returning cache hit");
                 let deserialized = S::DeserializedValue::<O>::try_from_store_value(serialized)?;
@@ -190,9 +194,7 @@ where
                 let output = f().await?;
                 let deserialized = S::construct_deserialized(output);
                 let serialized_value = deserialized.try_into_store_value()?;
-                self.inner
-                    .store_serialized_by_key(&full_key, serialized_value)
-                    .await?;
+                S::store_serialized_by_key(&mut lock, &full_key, serialized_value).await?;
                 Ok(S::extract_deserialized(deserialized))
             }
         })

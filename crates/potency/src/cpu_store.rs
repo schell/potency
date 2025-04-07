@@ -4,7 +4,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use async_lock::RwLock;
+use async_lock::{RwLock, RwLockWriteGuard};
 
 use super::*;
 
@@ -15,11 +15,15 @@ pub struct CpuStore {
 
 impl IsStore for CpuStore {
     type Error = crate::json::Error;
-
+    type Lock<'a> = RwLockWriteGuard<'a, BTreeMap<Vec<String>, serde_json::Value>>;
     type StoreValue = crate::json::JsonSerialized;
 
-    fn fetch_serialized_by_key<'a>(
-        &'a self,
+    fn lock<'a>(&'a self) -> Pin<Box<dyn Future<Output = Self::Lock<'a>> + 'a>> {
+        Box::pin(async move { self.inner.write().await })
+    }
+
+    fn fetch_serialized_by_key<'a, 'l: 'a>(
+        lock: &'a Self::Lock<'l>,
         key: &'a [impl AsRef<str>],
     ) -> Stored<'a, Option<Self::StoreValue>, Self::Error> {
         let key = key
@@ -28,8 +32,7 @@ impl IsStore for CpuStore {
             .collect::<Vec<_>>();
         Box::pin(async move {
             log::trace!("fetching key {key:?}");
-            let guard = self.inner.read().await;
-            match guard.get(&key) {
+            match lock.get(&key) {
                 None => {
                     log::trace!("  {key:?} not found");
                     Ok(None)
@@ -42,8 +45,8 @@ impl IsStore for CpuStore {
         })
     }
 
-    fn store_serialized_by_key<'a>(
-        &'a self,
+    fn store_serialized_by_key<'a, 'l: 'a>(
+        lock: &'a mut Self::Lock<'l>,
         key: &'a [impl AsRef<str>],
         serialized_value: Self::StoreValue,
     ) -> Stored<'a, (), Self::Error> {
@@ -56,8 +59,7 @@ impl IsStore for CpuStore {
                 "storing {key:?}: '{}'",
                 serde_json::to_string(&serialized_value.0).unwrap()
             );
-            let mut guard = self.inner.write().await;
-            guard.insert(key, serialized_value.0);
+            lock.insert(key, serialized_value.0);
             Ok(())
         })
     }
@@ -104,27 +106,30 @@ mod test {
         let _ = env_logger::builder().try_init();
         smol::block_on(async {
             let store = CpuStore::new();
-            let maybe_value = store.fetch_serialized_by_key(&["hello"]).await.unwrap();
-            assert_eq!(None, maybe_value);
+            {
+                let mut lock = store.lock().await;
+                let maybe_value = CpuStore::fetch_serialized_by_key(&lock, &["hello"])
+                    .await
+                    .unwrap();
+                assert_eq!(None, maybe_value);
 
-            let value = JsonDeserialized((0u32, 1.0f32, "goodbye".to_string()));
-            let result: Result<JsonSerialized, Error> = value.try_into_store_value();
-            let store_value = result.unwrap();
-            store
-                .store_serialized_by_key(&["hello"], store_value)
-                .await
-                .unwrap();
+                let value = JsonDeserialized((0u32, 1.0f32, "goodbye".to_string()));
+                let result: Result<JsonSerialized, Error> = value.try_into_store_value();
+                let store_value = result.unwrap();
+                CpuStore::store_serialized_by_key(&mut lock, &["hello"], store_value)
+                    .await
+                    .unwrap();
 
-            let stored = store
-                .fetch_serialized_by_key(&["hello"])
-                .await
-                .unwrap()
-                .unwrap();
-            let result: Result<JsonDeserialized<(u32, f32, String)>, Error> =
-                JsonDeserialized::try_from_store_value(stored);
+                let stored = CpuStore::fetch_serialized_by_key(&lock, &["hello"])
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let result: Result<JsonDeserialized<(u32, f32, String)>, Error> =
+                    JsonDeserialized::try_from_store_value(stored);
 
-            let stored_value = result.unwrap();
-            assert_eq!(value.0, stored_value.0);
+                let stored_value = result.unwrap();
+                assert_eq!(value.0, stored_value.0);
+            }
 
             let store = Store::new(store);
             let millis_to_wait = 500;
