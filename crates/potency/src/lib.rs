@@ -6,8 +6,12 @@
 
 use std::{future::Future, marker::PhantomData, pin::Pin};
 
+#[cfg(feature = "json")]
+pub mod json;
 #[cfg(feature = "cpu-store")]
 pub mod cpu_store;
+#[cfg(feature = "sqlite-store")]
+pub mod sqlite_store;
 
 mod tuple;
 pub use tuple::*;

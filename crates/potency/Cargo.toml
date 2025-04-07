@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["cpu-store"]
-cpu-store = ["dep:async-lock", "dep:serde", "dep:serde_json", "dep:snafu"]
+default = ["json", "cpu-store", "sqlite-store"]
+json = ["dep:serde", "dep:serde_json", "dep:snafu"]
+cpu-store = ["json", "dep:async-lock"]
+sqlite-store = ["json", "dep:sqlite"]
 
 [dependencies]
 async-lock = { workspace = true, optional = true }
@@ -13,6 +15,7 @@ log.workspace = true
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }
 snafu = { workspace = true, optional = true }
+sqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 env_logger.workspace = true

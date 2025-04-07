@@ -14,15 +14,13 @@ runtime itself is asynchronous, but sync functions can be used as the "process".
 ## goals
 
 * replace bespoke persistance and idempontency processes with `potency`+ your raw operations
-* local store support for
+* cache/storage support for
   - [x] in memory
-  - [ ] flat-file JSON
-  - [ ] sqlite
-* remote store support for 
+  - [x] sqlite
   - [ ] AWS Dynamo DB
   - [ ] Postgres
+* [ ] replicate / sync storages
 * multi-color support
   - [x] sync
   - [x] async
 * [ ] easy key generation
-* [ ] migrations

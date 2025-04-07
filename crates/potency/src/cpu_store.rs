@@ -5,44 +5,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_lock::RwLock;
-use snafu::prelude::*;
 
 use super::*;
-
-#[derive(Snafu, Debug)]
-pub enum Error {
-    #[snafu(display("Error serialize: {source}"))]
-    Serialize { source: serde_json::Error },
-
-    #[snafu(display("Error deserializing: {source}"))]
-    Deserialize { source: serde_json::Error },
-
-    #[snafu(display("{msg}"))]
-    Other { msg: String },
-}
-
-pub struct CpuStoreDeserializedValue<T>(T);
-
-#[derive(Debug, PartialEq)]
-pub struct CpuStoreValue(serde_json::Value);
-
-impl<T: serde::de::DeserializeOwned> DeserializeFrom<CpuStoreValue, Error>
-    for CpuStoreDeserializedValue<T>
-{
-    fn try_from_store_value(stored: CpuStoreValue) -> Result<Self, Error> {
-        let value = serde_json::from_value(stored.0).context(DeserializeSnafu)?;
-        Ok(Self(value))
-    }
-}
-
-impl<T: Clone + serde::Serialize> SerializeTo<CpuStoreValue, Error>
-    for CpuStoreDeserializedValue<T>
-{
-    fn try_into_store_value(&self) -> Result<CpuStoreValue, Error> {
-        let value = serde_json::to_value(self.0.clone()).context(SerializeSnafu)?;
-        Ok(CpuStoreValue(value))
-    }
-}
 
 #[derive(Clone)]
 pub struct CpuStore {
@@ -50,9 +14,9 @@ pub struct CpuStore {
 }
 
 impl IsStore for CpuStore {
-    type Error = Error;
+    type Error = crate::json::Error;
 
-    type StoreValue = CpuStoreValue;
+    type StoreValue = crate::json::JsonSerialized;
 
     fn fetch_serialized_by_key<'a>(
         &'a self,
@@ -72,7 +36,7 @@ impl IsStore for CpuStore {
                 }
                 Some(value) => {
                     log::trace!("  found {key:?}");
-                    Ok(Some(CpuStoreValue(value.clone())))
+                    Ok(Some(value.clone().into()))
                 }
             }
         })
@@ -98,10 +62,10 @@ impl IsStore for CpuStore {
         })
     }
 
-    type DeserializedValue<T> = CpuStoreDeserializedValue<T>;
+    type DeserializedValue<T> = crate::json::JsonDeserialized<T>;
 
     fn construct_deserialized<T>(value: T) -> Self::DeserializedValue<T> {
-        CpuStoreDeserializedValue(value)
+        value.into()
     }
 
     fn extract_deserialized<T>(value: Self::DeserializedValue<T>) -> T {
@@ -126,6 +90,8 @@ impl Default for CpuStore {
 #[cfg(test)]
 mod test {
 
+    use json::{Error, JsonDeserialized, JsonSerialized};
+
     use super::*;
 
     async fn test_function(millis_to_wait: u32, string: String) -> Result<String, Error> {
@@ -141,10 +107,11 @@ mod test {
             let maybe_value = store.fetch_serialized_by_key(&["hello"]).await.unwrap();
             assert_eq!(None, maybe_value);
 
-            let value = CpuStoreDeserializedValue((0u32, 1.0f32, "goodbye".to_string()));
-            let cpu_value: CpuStoreValue = value.try_into_store_value().unwrap();
+            let value = JsonDeserialized((0u32, 1.0f32, "goodbye".to_string()));
+            let result: Result<JsonSerialized, Error> = value.try_into_store_value();
+            let store_value = result.unwrap();
             store
-                .store_serialized_by_key(&["hello"], cpu_value)
+                .store_serialized_by_key(&["hello"], store_value)
                 .await
                 .unwrap();
 
@@ -153,9 +120,10 @@ mod test {
                 .await
                 .unwrap()
                 .unwrap();
-            let stored_value =
-                CpuStoreDeserializedValue::<(u32, f32, String)>::try_from_store_value(stored)
-                    .unwrap();
+            let result: Result<JsonDeserialized<(u32, f32, String)>, Error> =
+                JsonDeserialized::try_from_store_value(stored);
+
+            let stored_value = result.unwrap();
             assert_eq!(value.0, stored_value.0);
 
             let store = Store::new(store);
@@ -190,31 +158,25 @@ mod test {
 
     use crate::{cpu_store::CpuStore, Store};
 
-    async fn test_async_function_no_params_no_return() -> Result<(), super::Error> {
+    async fn test_async_function_no_params_no_return() -> Result<(), Error> {
         println!("done!");
         Ok(())
     }
 
-    async fn test_async_function_one_param_string(name: String) -> Result<String, super::Error> {
+    async fn test_async_function_one_param_string(name: String) -> Result<String, Error> {
         Ok(format!(
             "{name} - this is a test of the emergency pants system",
         ))
     }
 
-    async fn test_async_function_one_param_string_2(
-        millis_to_wait: u32,
-    ) -> Result<String, super::Error> {
+    async fn test_async_function_one_param_string_2(millis_to_wait: u32) -> Result<String, Error> {
         smol::Timer::after(std::time::Duration::from_millis(millis_to_wait as u64)).await;
         Ok(format!(
             "{millis_to_wait} - this is a timed test of the emergency pants system"
         ))
     }
 
-    fn test_function_three_params_string(
-        a: f32,
-        b: u32,
-        c: String,
-    ) -> Result<String, super::Error> {
+    fn test_function_three_params_string(a: f32, b: u32, c: String) -> Result<String, Error> {
         Ok(format!("({a}, {b}, {c})"))
     }
 
