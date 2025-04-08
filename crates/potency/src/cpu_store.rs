@@ -10,12 +10,12 @@ use super::*;
 
 #[derive(Clone)]
 pub struct CpuStore {
-    inner: Arc<RwLock<BTreeMap<Vec<String>, serde_json::Value>>>,
+    inner: Arc<RwLock<BTreeMap<String, serde_json::Value>>>,
 }
 
 impl IsStore for CpuStore {
     type Error = crate::json::Error;
-    type Lock<'a> = RwLockWriteGuard<'a, BTreeMap<Vec<String>, serde_json::Value>>;
+    type Lock<'a> = RwLockWriteGuard<'a, BTreeMap<String, serde_json::Value>>;
     type StoreValue = crate::json::JsonSerialized;
 
     fn lock<'a>(&'a self) -> Pin<Box<dyn Future<Output = Self::Lock<'a>> + 'a>> {
@@ -24,44 +24,47 @@ impl IsStore for CpuStore {
 
     fn fetch_serialized_by_key<'a, 'l: 'a>(
         lock: &'a Self::Lock<'l>,
-        key: &'a [impl AsRef<str>],
+        key: impl AsRef<str> + 'a,
     ) -> Stored<'a, Option<Self::StoreValue>, Self::Error> {
-        let key = key
-            .iter()
-            .map(|k| k.as_ref().to_owned())
-            .collect::<Vec<_>>();
-        Box::pin(async move {
-            log::trace!("fetching key {key:?}");
-            match lock.get(&key) {
-                None => {
-                    log::trace!("  {key:?} not found");
-                    Ok(None)
-                }
-                Some(value) => {
-                    log::trace!("  found {key:?}");
-                    Ok(Some(value.clone().into()))
-                }
+        log::trace!("fetching key {}", key.as_ref());
+
+        Box::pin(std::future::ready(match lock.get(key.as_ref()) {
+            None => {
+                log::trace!("  {} not found", key.as_ref());
+                Ok(None)
             }
-        })
+            Some(value) => {
+                log::trace!("  found {}", key.as_ref());
+                Ok(Some(value.clone().into()))
+            }
+        }))
     }
 
     fn store_serialized_by_key<'a, 'l: 'a>(
         lock: &'a mut Self::Lock<'l>,
-        key: &'a [impl AsRef<str>],
+        key: impl AsRef<str> + 'a,
         serialized_value: Self::StoreValue,
     ) -> Stored<'a, (), Self::Error> {
-        let key = key
-            .iter()
-            .map(|k| k.as_ref().to_owned())
-            .collect::<Vec<_>>();
-        Box::pin(async move {
+        Box::pin(std::future::ready({
             log::trace!(
-                "storing {key:?}: '{}'",
+                "storing {}: '{}'",
+                key.as_ref(),
                 serde_json::to_string(&serialized_value.0).unwrap()
             );
-            lock.insert(key, serialized_value.0);
+            lock.insert(key.as_ref().to_owned(), serialized_value.0);
             Ok(())
-        })
+        }))
+    }
+
+    fn delete_key<'a, 'l: 'a>(
+        lock: &'a mut Self::Lock<'a>,
+        key: impl AsRef<str> + 'a,
+    ) -> Stored<'a, (), Self::Error> {
+        Box::pin(std::future::ready({
+            log::trace!("deleting {}", key.as_ref());
+            let _ = lock.remove(key.as_ref());
+            Ok(())
+        }))
     }
 
     type DeserializedValue<T> = crate::json::JsonDeserialized<T>;
@@ -108,7 +111,7 @@ mod test {
             let store = CpuStore::new();
             {
                 let mut lock = store.lock().await;
-                let maybe_value = CpuStore::fetch_serialized_by_key(&lock, &["hello"])
+                let maybe_value = CpuStore::fetch_serialized_by_key(&lock, "hello")
                     .await
                     .unwrap();
                 assert_eq!(None, maybe_value);
@@ -116,11 +119,11 @@ mod test {
                 let value = JsonDeserialized((0u32, 1.0f32, "goodbye".to_string()));
                 let result: Result<JsonSerialized, Error> = value.try_into_store_value();
                 let store_value = result.unwrap();
-                CpuStore::store_serialized_by_key(&mut lock, &["hello"], store_value)
+                CpuStore::store_serialized_by_key(&mut lock, "hello", store_value)
                     .await
                     .unwrap();
 
-                let stored = CpuStore::fetch_serialized_by_key(&lock, &["hello"])
+                let stored = CpuStore::fetch_serialized_by_key(&lock, "hello")
                     .await
                     .unwrap()
                     .unwrap();
@@ -136,7 +139,7 @@ mod test {
             let input_string = "To each their own.".to_string();
             let start = std::time::Instant::now();
             let output_string = store
-                .fetch_or_else(&["the", "key"], || {
+                .fetch_or_else("the key", || {
                     test_function(millis_to_wait, input_string.clone())
                 })
                 .await
@@ -147,9 +150,7 @@ mod test {
 
             let start = std::time::Instant::now();
             let _output_string = store
-                .fetch_or_else(&["the", "key"], || {
-                    test_function(millis_to_wait, input_string)
-                })
+                .fetch_or_else("the key", || test_function(millis_to_wait, input_string))
                 .await
                 .unwrap();
             let elapsed = start.elapsed();

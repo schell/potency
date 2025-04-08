@@ -16,6 +16,9 @@ pub mod sqlite_store;
 mod tuple;
 pub use tuple::*;
 
+mod key;
+pub use key::*;
+
 mod async_impl;
 mod sync_impl;
 
@@ -42,48 +45,19 @@ pub trait IsStore: Clone {
 
     fn fetch_serialized_by_key<'a, 'l: 'a>(
         lock: &'a Self::Lock<'l>,
-        key: &'a [impl AsRef<str>],
+        key: impl AsRef<str> + 'a,
     ) -> Stored<'a, Option<Self::StoreValue>, Self::Error>;
 
     fn store_serialized_by_key<'a, 'l: 'a>(
         lock: &'a mut Self::Lock<'l>,
-        key: &'a [impl AsRef<str>],
+        key: impl AsRef<str> + 'a,
         serialized_value: Self::StoreValue,
     ) -> Stored<'a, (), Self::Error>;
-}
 
-pub trait AsKey {
-    fn as_key(&self) -> String;
-}
-
-impl AsKey for () {
-    fn as_key(&self) -> String {
-        "()".to_owned()
-    }
-}
-
-impl AsKey for String {
-    fn as_key(&self) -> String {
-        self.clone()
-    }
-}
-
-impl AsKey for &str {
-    fn as_key(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl AsKey for u32 {
-    fn as_key(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl AsKey for f32 {
-    fn as_key(&self) -> String {
-        self.to_string()
-    }
+    fn delete_key<'a, 'l: 'a>(
+        lock: &'a mut Self::Lock<'a>,
+        key: impl AsRef<str> + 'a,
+    ) -> Stored<'a, (), Self::Error>;
 }
 
 pub struct Builder<'a, S, I, F, C = Sync> {
@@ -148,7 +122,7 @@ where
             fn_pair,
         } = self;
         let fn_call = fn_pair.construct_fn(input);
-        store.fetch_or_else(&key, fn_call).await
+        store.fetch_or_else(key.join(","), fn_call).await
     }
 }
 
@@ -168,7 +142,7 @@ where
 
     fn fetch_or_else<'a, O, E, Fut>(
         &'a self,
-        key: &'a [impl AsRef<str>],
+        key: impl AsRef<str> + 'a,
         f: impl FnOnce() -> Fut + 'a,
     ) -> Pin<Box<dyn Future<Output = Result<O, S::Error>> + 'a>>
     where
@@ -177,12 +151,11 @@ where
         S::DeserializedValue<O>:
             SerializeTo<S::StoreValue, S::Error> + DeserializeFrom<S::StoreValue, S::Error>,
     {
-        let mut full_key = self.key.clone();
-        full_key.extend(key.iter().map(|k| k.as_ref().to_string()));
+        let full_key = key.as_ref().to_owned();
         Box::pin(async move {
             let mut lock = self.inner.lock().await;
             let maybe_serialized_value: Option<S::StoreValue> =
-                S::fetch_serialized_by_key(&lock, &full_key).await?;
+                S::fetch_serialized_by_key(&lock, &key).await?;
             if let Some(serialized) = maybe_serialized_value {
                 log::trace!("{full_key:?} is cached, returning cache hit");
                 let deserialized = S::DeserializedValue::<O>::try_from_store_value(serialized)?;

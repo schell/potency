@@ -78,18 +78,13 @@ impl IsStore for SqliteStore {
 
     fn fetch_serialized_by_key<'a, 'l: 'a>(
         lock: &'a Self::Lock<'l>,
-        key: &'a [impl AsRef<str>],
+        key: impl AsRef<str> + 'a,
     ) -> crate::Stored<'a, Option<Self::StoreValue>, Self::Error> {
-        let key: String = key
-            .iter()
-            .map(|k| k.as_ref().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
         Box::pin(async move {
-            log::trace!("fetching {key}");
+            log::trace!("fetching {}", key.as_ref());
             let query = "SELECT value FROM potency WHERE key = :key";
             let mut statement = lock.prepare(query)?;
-            statement.bind((":key", key.as_str()))?;
+            statement.bind((":key", key.as_ref()))?;
             match statement.next()? {
                 sqlite::State::Row => {
                     let string_value = statement.read::<String, _>("value")?;
@@ -104,21 +99,16 @@ impl IsStore for SqliteStore {
 
     fn store_serialized_by_key<'a, 'l: 'a>(
         lock: &'a mut Self::Lock<'l>,
-        key: &'a [impl AsRef<str>],
+        key: impl AsRef<str> + 'a,
         serialized_value: Self::StoreValue,
     ) -> crate::Stored<'a, (), Self::Error> {
-        let key: String = key
-            .iter()
-            .map(|k| k.as_ref().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
         Box::pin(async move {
             // UNWRAP: safe because we know `Value` always serializes.
             let value = serde_json::to_string(&serialized_value.0).unwrap();
-            log::trace!("storing key {key}: {value}");
+            log::trace!("storing key {}: {value}", key.as_ref());
             let query = "INSERT INTO potency (key, value) VALUES (:key, :value)";
             let mut statement = lock.prepare(query)?;
-            statement.bind(&[(":key", key.as_str()), (":value", value.as_str())][..])?;
+            statement.bind(&[(":key", key.as_ref()), (":value", value.as_str())][..])?;
             match statement.next()? {
                 sqlite::State::Row => {
                     log::trace!("Row");
@@ -127,6 +117,19 @@ impl IsStore for SqliteStore {
                     log::trace!("Done");
                 }
             }
+            Ok(())
+        })
+    }
+
+    fn delete_key<'a, 'l: 'a>(
+        lock: &'a mut Self::Lock<'a>,
+        key: impl AsRef<str> + 'a,
+    ) -> crate::Stored<'a, (), Self::Error> {
+        Box::pin(async move {
+            let mut statement = lock.prepare("REMOVE FROM potency WHERE key = :key")?;
+            statement.bind(("key", key.as_ref()))?;
+            let result = statement.next()?;
+            log::trace!("delete {result:?}");
             Ok(())
         })
     }
