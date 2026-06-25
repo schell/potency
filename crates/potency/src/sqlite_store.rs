@@ -106,7 +106,10 @@ impl IsStore for SqliteStore {
             // UNWRAP: safe because we know `Value` always serializes.
             let value = serde_json::to_string(&serialized_value.0).unwrap();
             log::trace!("storing key {}: {value}", key.as_ref());
-            let query = "INSERT INTO potency (key, value) VALUES (:key, :value)";
+            // `INSERT OR REPLACE` so that re-storing a key (e.g. after a
+            // verify-invalidated effect is recomputed) overwrites rather than
+            // failing the PRIMARY KEY constraint.
+            let query = "INSERT OR REPLACE INTO potency (key, value) VALUES (:key, :value)";
             let mut statement = lock.prepare(query)?;
             statement.bind(&[(":key", key.as_ref()), (":value", value.as_str())][..])?;
             match statement.next()? {
@@ -122,12 +125,14 @@ impl IsStore for SqliteStore {
     }
 
     fn delete_key<'a, 'l: 'a>(
-        lock: &'a mut Self::Lock<'a>,
+        lock: &'a mut Self::Lock<'l>,
         key: impl AsRef<str> + 'a,
     ) -> crate::Stored<'a, (), Self::Error> {
         Box::pin(async move {
-            let mut statement = lock.prepare("REMOVE FROM potency WHERE key = :key")?;
-            statement.bind(("key", key.as_ref()))?;
+            // `DELETE` (not the invalid `REMOVE`) is required SQL; the durable
+            // effect protocol relies on this to invalidate stale entries.
+            let mut statement = lock.prepare("DELETE FROM potency WHERE key = :key")?;
+            statement.bind((":key", key.as_ref()))?;
             let result = statement.next()?;
             log::trace!("delete {result:?}");
             Ok(())
@@ -143,7 +148,10 @@ impl IsStore for SqliteStore {
 
 #[cfg(test)]
 mod test {
-    use crate::Store;
+    use crate::{
+        json::{JsonDeserialized, JsonSerialized},
+        IsStore, SerializeTo, Store,
+    };
 
     use super::SqliteStore;
 
@@ -169,6 +177,54 @@ mod test {
                 .await
                 .unwrap();
             assert_eq!(6, sum);
+        });
+    }
+
+    /// Regression test for the `DELETE` and `INSERT OR REPLACE` SQL fixes.
+    /// The durable effect protocol relies on both: re-storing an existing key
+    /// (overwrite) and deleting a stale key.
+    #[test]
+    fn sqlite_delete_and_overwrite() {
+        let _ = env_logger::builder().try_init();
+        smol::block_on(async {
+            let store = SqliteStore::open(":memory:").await.unwrap();
+
+            let val = |n: u32| -> JsonSerialized {
+                let d: JsonDeserialized<u32> = JsonDeserialized(n);
+                SerializeTo::<JsonSerialized, super::Error>::try_into_store_value(&d).unwrap()
+            };
+
+            // Store, then overwrite the same key (would fail with plain INSERT).
+            {
+                let mut lock = store.lock().await;
+                SqliteStore::store_serialized_by_key(&mut lock, "k", val(1))
+                    .await
+                    .unwrap();
+                SqliteStore::store_serialized_by_key(&mut lock, "k", val(2))
+                    .await
+                    .unwrap();
+            }
+            {
+                let lock = store.lock().await;
+                let got = SqliteStore::fetch_serialized_by_key(&lock, "k")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(got.0, serde_json::json!(2));
+            }
+
+            // Delete (would error with invalid `REMOVE`).
+            {
+                let mut lock = store.lock().await;
+                SqliteStore::delete_key(&mut lock, "k").await.unwrap();
+            }
+            {
+                let lock = store.lock().await;
+                let gone = SqliteStore::fetch_serialized_by_key(&lock, "k")
+                    .await
+                    .unwrap();
+                assert!(gone.is_none());
+            }
         });
     }
 }

@@ -57,7 +57,7 @@ impl IsStore for CpuStore {
     }
 
     fn delete_key<'a, 'l: 'a>(
-        lock: &'a mut Self::Lock<'a>,
+        lock: &'a mut Self::Lock<'l>,
         key: impl AsRef<str> + 'a,
     ) -> Stored<'a, (), Self::Error> {
         Box::pin(std::future::ready({

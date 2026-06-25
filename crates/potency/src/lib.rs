@@ -13,6 +13,9 @@ pub mod json;
 #[cfg(feature = "sqlite-store")]
 pub mod sqlite_store;
 
+#[cfg(feature = "json")]
+pub mod effect;
+
 mod tuple;
 pub use tuple::*;
 
@@ -55,7 +58,7 @@ pub trait IsStore: Clone {
     ) -> Stored<'a, (), Self::Error>;
 
     fn delete_key<'a, 'l: 'a>(
-        lock: &'a mut Self::Lock<'a>,
+        lock: &'a mut Self::Lock<'l>,
         key: impl AsRef<str> + 'a,
     ) -> Stored<'a, (), Self::Error>;
 }
@@ -202,5 +205,196 @@ where
                 _input: std::marker::PhantomData,
             },
         }
+    }
+
+    /// Begin building a durable *side-effect* entry.
+    ///
+    /// Unlike [`Store::entry`]/[`Store::entry_async`], which cache a function's
+    /// return value, an effect represents an operation whose real product is
+    /// *external state* (e.g. files on disk). The effect's [`Manifest`] — a
+    /// small, serializable description of the committed result — is what gets
+    /// cached. On replay, the effect is skipped only if its manifest is cached
+    /// **and** [`Effect::verify`] confirms the external state still holds.
+    ///
+    /// [`Manifest`]: Effect::Manifest
+    pub fn effect<E>(&self, effect: E) -> EffectBuilder<'_, S, E> {
+        EffectBuilder {
+            store: self,
+            key: self.key.clone(),
+            effect,
+        }
+    }
+}
+
+/// A durable side-effecting operation.
+///
+/// The contract is split into four steps so that `potency` can own the
+/// ordering guarantee that makes replay safe:
+///
+/// 1. [`fresh_staging`] — allocate a clean staging location for a new attempt.
+/// 2. [`produce`] — perform the work into staging, returning a [`Manifest`].
+/// 3. [`commit`] — atomically promote staging to its final location.
+/// 4. [`verify`] — on a cache hit, confirm the committed effect still holds.
+///
+/// **Invariant maintained by [`EffectBuilder::run`]:** a cache entry exists
+/// *iff* the effect is committed. A crash before the manifest is stored leaves
+/// no entry, so the next run re-attempts cleanly.
+///
+/// [`Manifest`]: Effect::Manifest
+/// [`fresh_staging`]: Effect::fresh_staging
+/// [`produce`]: Effect::produce
+/// [`commit`]: Effect::commit
+/// [`verify`]: Effect::verify
+pub trait Effect {
+    /// A handle to where work happens before commit (e.g. a temp directory).
+    type Staging;
+    /// A small, serializable record of the committed effect.
+    type Manifest;
+    /// The effect's error type.
+    type Error;
+
+    /// Allocate a fresh staging location for a new attempt, keyed by `key`.
+    ///
+    /// Implementations should ensure the location starts empty (e.g. remove any
+    /// leftover staging from a previously-crashed attempt).
+    fn fresh_staging<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Stored<'a, Self::Staging, Self::Error>;
+
+    /// Perform the work into `staging`, returning a manifest describing it.
+    ///
+    /// Takes `staging` by reference so the same handle can be passed to
+    /// [`commit`](Effect::commit) afterwards.
+    fn produce<'a>(
+        &'a self,
+        staging: &'a Self::Staging,
+    ) -> Stored<'a, Self::Manifest, Self::Error>;
+
+    /// Atomically promote `staging` to its final committed location.
+    fn commit<'a>(
+        &'a self,
+        staging: &'a Self::Staging,
+        manifest: &'a Self::Manifest,
+    ) -> Stored<'a, (), Self::Error>;
+
+    /// On a cache hit, confirm the committed effect still holds.
+    fn verify<'a>(
+        &'a self,
+        manifest: &'a Self::Manifest,
+    ) -> Stored<'a, bool, Self::Error>;
+}
+
+/// Error returned by [`EffectBuilder::run`]: either from the backing store or
+/// from the effect itself. Keeps the two error domains distinct rather than
+/// forcing one to absorb the other.
+#[derive(Debug)]
+pub enum EffectError<SE, EE> {
+    /// An error from the backing [`Store`].
+    Store(SE),
+    /// An error from the [`Effect`].
+    Effect(EE),
+}
+
+impl<SE: std::fmt::Display, EE: std::fmt::Display> std::fmt::Display for EffectError<SE, EE> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EffectError::Store(e) => write!(f, "store error: {e}"),
+            EffectError::Effect(e) => write!(f, "effect error: {e}"),
+        }
+    }
+}
+
+impl<SE, EE> std::error::Error for EffectError<SE, EE>
+where
+    SE: std::fmt::Debug + std::fmt::Display,
+    EE: std::fmt::Debug + std::fmt::Display,
+{
+}
+
+/// Builder for a durable side-effect entry. Compose the cache key with
+/// [`EffectBuilder::param`], then call [`EffectBuilder::run`].
+pub struct EffectBuilder<'a, S, E> {
+    store: &'a Store<S>,
+    key: Vec<String>,
+    effect: E,
+}
+
+impl<'a, S, E> EffectBuilder<'a, S, E> {
+    /// Append a parameter to the effect's cache key.
+    pub fn param<T: AsKey>(mut self, input: T) -> Self {
+        self.key.push(input.as_key());
+        self
+    }
+
+    /// Append a namespace segment to the effect's cache key.
+    pub fn namespace(mut self, ns: impl AsRef<str>) -> Self {
+        self.key.push(ns.as_ref().to_string());
+        self
+    }
+}
+
+impl<S, E, M, Err> EffectBuilder<'_, S, E>
+where
+    S: IsStore,
+    E: Effect<Manifest = M, Error = Err>,
+    M: Clone,
+    S::DeserializedValue<M>:
+        SerializeTo<S::StoreValue, S::Error> + DeserializeFrom<S::StoreValue, S::Error>,
+{
+    /// Run the durable effect protocol.
+    ///
+    /// - **Hit + valid:** returns the cached manifest, performing no work.
+    /// - **Hit + stale:** deletes the entry and re-runs.
+    /// - **Miss:** stages, produces, commits, then records the manifest.
+    pub async fn run(self) -> Result<M, EffectError<S::Error, Err>> {
+        let Self {
+            store,
+            key,
+            effect,
+        } = self;
+        let full_key = key.join(",");
+        let mut lock = store.inner.lock().await;
+
+        // 1. Check the cache.
+        let cached: Option<S::StoreValue> = S::fetch_serialized_by_key(&lock, &full_key)
+            .await
+            .map_err(EffectError::Store)?;
+        if let Some(serialized) = cached {
+            let deserialized = S::DeserializedValue::<M>::try_from_store_value(serialized)
+                .map_err(EffectError::Store)?;
+            let manifest = S::extract_deserialized(deserialized);
+            // 2. Verify the committed effect still holds.
+            if effect.verify(&manifest).await.map_err(EffectError::Effect)? {
+                log::trace!("{full_key:?} effect cache hit (verified)");
+                return Ok(manifest);
+            }
+            log::trace!("{full_key:?} effect cache stale; invalidating");
+            S::delete_key(&mut lock, &full_key)
+                .await
+                .map_err(EffectError::Store)?;
+        }
+
+        // 3. Miss (or invalidated): stage -> produce -> commit -> record.
+        log::trace!("{full_key:?} effect computing");
+        let staging = effect
+            .fresh_staging(&full_key)
+            .await
+            .map_err(EffectError::Effect)?;
+        let manifest = effect.produce(&staging).await.map_err(EffectError::Effect)?;
+        effect
+            .commit(&staging, &manifest)
+            .await
+            .map_err(EffectError::Effect)?;
+
+        // 4. Only now record the manifest: entry exists iff committed.
+        let deserialized = S::construct_deserialized(manifest.clone());
+        let serialized = deserialized
+            .try_into_store_value()
+            .map_err(EffectError::Store)?;
+        S::store_serialized_by_key(&mut lock, &full_key, serialized)
+            .await
+            .map_err(EffectError::Store)?;
+        Ok(manifest)
     }
 }
