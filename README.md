@@ -1,26 +1,71 @@
 # potency
-`potency` is a bare-bones durability and synchronization library meant to aid in writing idempotent processes without having to think too much.
 
-For some background on durability, check out: 
+`potency` is a bare-bones durability and synchronization library for writing
+idempotent processes without thinking too hard.
 
-https://flawless.dev/docs/
+For background on durability: <https://flawless.dev/docs/>
 
-The idea is roughly that the results of certain "expensive" and fallible processes are cached with a key known by your code, based on namespaces and input parameters. 
-Before running an expensive fallible process, the cache is queried by this known key and if the cache is hit, the result is read out of the cache instead of being computed.
+The rough idea: the results of "expensive" and fallible processes are cached
+under a key derived from a namespace and input parameters. Before running the
+work, the cache is queried; on a hit the result is read back instead of
+recomputed.
 
-`potency` offers some type-level machinery to abstract over multiple persistance layers as well as support for multi-colored functions (sync and async). Keep in mind the 
-runtime itself is asynchronous, but sync functions can be used as the "process".
+`potency` abstracts over multiple persistence layers via `Store<S>` and
+supports **multi-color** functions — both sync (`fn -> T`) and async
+(`async fn -> impl Future<Output = T>`).
 
-## goals
+> **The `potency` API itself is always async.** Every builder returns a
+> future that must be `.await`ed, even when the work you're wrapping is a
+> plain sync function. Multi-color describes the *work*, not the runtime.
 
-* replace bespoke persistance and idempontency processes with `potency`+ your raw operations
-* cache/storage support for
-  - [x] in memory
-  - [x] sqlite
-  - [ ] AWS Dynamo DB
+## Quickstart
+
+```rust,no_run
+# async fn doc() {
+use potency::{cpu_store::CpuStore, Store};
+
+async fn three(a: u32, b: u32, c: u32) -> Result<u32, potency::json::Error> {
+    Ok(a + b + c)
+}
+
+let store = Store::new(CpuStore::new());
+let n = store
+    .entry_async(three)
+    .param(1u32).param(2u32).param(3u32)
+    .run()
+    .await
+    .unwrap();
+assert_eq!(n, 6);
+# }
+```
+
+## Learn more
+
+The full tutorial — namespaces, keying, custom stores, durable side-effects,
+and "when not to use this" — lives in the `tutorial` module of the crate docs:
+
+```sh
+cargo doc --open
+```
+
+Or browse the source at
+[`crates/potency/src/tutorial.rs`](crates/potency/src/tutorial.rs).
+
+## Goals
+
+- replace bespoke persistence and idempotency processes with `potency` + your
+  raw operations
+- cache/storage support for
+  - [x] in memory (`cpu_store`)
+  - [x] sqlite (`sqlite_store`)
+  - [ ] AWS DynamoDB
   - [ ] Postgres
-* [ ] replicate / sync storages
-* multi-color support
-  - [x] sync
-  - [x] async
-* [ ] easy key generation
+- [ ] replicate / sync storages
+- multi-color support
+  - [x] sync (`Store::entry`)
+  - [x] async (`Store::entry_async`)
+- [ ] easy key generation
+
+## License
+
+Dual-licensed under MIT or Apache 2.0, at your option.

@@ -1,8 +1,49 @@
-//! `potency` provides a durability and sync engine all in one!
+//! `potency` is a bare-bones durability and synchronization library for
+//! writing idempotent processes without thinking too hard.
 //!
-//! But wait, there's more!
+//! For some background on durability:
 //!
-//! TODO: write about "more"
+//! <https://flawless.dev/docs/>
+//!
+//! The rough idea: the results of "expensive" and fallible processes are
+//! cached under a key derived from a namespace and input parameters. Before
+//! running the work, the cache is queried; on a hit the result is read back
+//! instead of recomputed.
+//!
+//! `potency` abstracts over multiple persistence layers via [`Store<S>`] and
+//! supports **multi-color** functions — both sync (`fn -> T`) and async
+//! (`async fn -> impl Future<Output = T>`).
+//!
+//! > **The `potency` API itself is always async.** Every builder returns a
+//! > future that must be `.await`ed, even when the work you're wrapping is a
+//! > plain sync function. Multi-color describes the *work*, not the runtime.
+//!
+//! ## Quickstart
+//!
+//! ```rust,no_run
+//! # async fn doc() {
+//! use potency::{cpu_store::CpuStore, Store};
+//!
+//! async fn three(a: u32, b: u32, c: u32) -> Result<u32, potency::json::Error> {
+//!     Ok(a + b + c)
+//! }
+//!
+//! let store = Store::new(CpuStore::new());
+//! let n = store
+//!     .entry_async(three)
+//!     .param(1u32).param(2u32).param(3u32)
+//!     .run()
+//!     .await
+//!     .unwrap();
+//! assert_eq!(n, 6);
+//! # }
+//! ```
+//!
+//! For the full walkthrough — namespaces, keying, custom stores, durable
+//! side-effects, and "when not to use this" — see the [`tutorial`] module.
+
+#[cfg(doc)]
+pub mod tutorial;
 
 use std::{future::Future, marker::PhantomData, pin::Pin};
 
@@ -184,7 +225,7 @@ where
         store
     }
 
-    pub fn entry<F>(&self, f: F) -> Builder<S, (), F> {
+    pub fn entry<F>(&self, f: F) -> Builder<'_, S, (), F> {
         let _input: PhantomData<(Sync, ())> = PhantomData;
         let fn_pair: FnPair<(), F, Sync> = FnPair { f, _input };
         Builder {
@@ -195,7 +236,7 @@ where
         }
     }
 
-    pub fn entry_async<F>(&self, f: F) -> Builder<S, (), F, Async> {
+    pub fn entry_async<F>(&self, f: F) -> Builder<'_, S, (), F, Async> {
         Builder {
             store: self,
             key: vec![],
@@ -257,19 +298,14 @@ pub trait Effect {
     ///
     /// Implementations should ensure the location starts empty (e.g. remove any
     /// leftover staging from a previously-crashed attempt).
-    fn fresh_staging<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> Stored<'a, Self::Staging, Self::Error>;
+    fn fresh_staging<'a>(&'a self, key: &'a str) -> Stored<'a, Self::Staging, Self::Error>;
 
     /// Perform the work into `staging`, returning a manifest describing it.
     ///
     /// Takes `staging` by reference so the same handle can be passed to
     /// [`commit`](Effect::commit) afterwards.
-    fn produce<'a>(
-        &'a self,
-        staging: &'a Self::Staging,
-    ) -> Stored<'a, Self::Manifest, Self::Error>;
+    fn produce<'a>(&'a self, staging: &'a Self::Staging)
+        -> Stored<'a, Self::Manifest, Self::Error>;
 
     /// Atomically promote `staging` to its final committed location.
     fn commit<'a>(
@@ -279,10 +315,7 @@ pub trait Effect {
     ) -> Stored<'a, (), Self::Error>;
 
     /// On a cache hit, confirm the committed effect still holds.
-    fn verify<'a>(
-        &'a self,
-        manifest: &'a Self::Manifest,
-    ) -> Stored<'a, bool, Self::Error>;
+    fn verify<'a>(&'a self, manifest: &'a Self::Manifest) -> Stored<'a, bool, Self::Error>;
 }
 
 /// Error returned by [`EffectBuilder::run`]: either from the backing store or
@@ -348,11 +381,7 @@ where
     /// - **Hit + stale:** deletes the entry and re-runs.
     /// - **Miss:** stages, produces, commits, then records the manifest.
     pub async fn run(self) -> Result<M, EffectError<S::Error, Err>> {
-        let Self {
-            store,
-            key,
-            effect,
-        } = self;
+        let Self { store, key, effect } = self;
         let full_key = key.join(",");
         let mut lock = store.inner.lock().await;
 
@@ -365,7 +394,11 @@ where
                 .map_err(EffectError::Store)?;
             let manifest = S::extract_deserialized(deserialized);
             // 2. Verify the committed effect still holds.
-            if effect.verify(&manifest).await.map_err(EffectError::Effect)? {
+            if effect
+                .verify(&manifest)
+                .await
+                .map_err(EffectError::Effect)?
+            {
                 log::trace!("{full_key:?} effect cache hit (verified)");
                 return Ok(manifest);
             }
@@ -381,7 +414,10 @@ where
             .fresh_staging(&full_key)
             .await
             .map_err(EffectError::Effect)?;
-        let manifest = effect.produce(&staging).await.map_err(EffectError::Effect)?;
+        let manifest = effect
+            .produce(&staging)
+            .await
+            .map_err(EffectError::Effect)?;
         effect
             .commit(&staging, &manifest)
             .await

@@ -1,5 +1,19 @@
-//! File-system side-effect helpers built on the generic [`Effect`](crate::Effect)
+//! File-system side-effect helpers built on the generic [`Effect`]
 //! trait.
+//!
+//! ## When to use `Effect` vs `entry` / `entry_async`
+//!
+//! [`Store::entry`][crate::Store::entry] and
+//! [`Store::entry_async`][crate::Store::entry_async] cache a function's
+//! *return value*. Use them when the value is the product.
+//!
+//! [`Effect`] is for work whose product is *external state* — files on disk,
+//! rows in a remote database, anything that can't be undone just by skipping
+//! the call. Re-running the function doesn't undo a file being written, so
+//! the question isn't "did we run this?" but "is the side effect still in
+//! place?" `Effect` answers that by recording a small, serializable
+//! [`Manifest`][Effect::Manifest] and verifying the external state on every
+//! replay.
 //!
 //! The common case for a durable side-effect is "produce a directory of files."
 //! [`FsEffect`] implements [`Effect`] for that case:
@@ -77,6 +91,32 @@ pub struct FsEffect<P> {
 ///
 /// The staging directory is `output_dir` with `.staging` appended, kept as a
 /// sibling so the commit rename is atomic.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// # async fn doc() -> Result<(), potency::EffectError<potency::json::Error, potency::effect::FsEffectError<std::io::Error>>> {
+/// use std::path::PathBuf;
+/// use potency::{cpu_store::CpuStore, effect::fs_effect, Store};
+///
+/// async fn render_frames(staging: PathBuf) -> Result<u64, std::io::Error> {
+///     std::fs::write(staging.join("frame_0.png"), b"x")?;
+///     std::fs::write(staging.join("frame_1.png"), b"x")?;
+///     Ok(2)
+/// }
+///
+/// let output = std::env::temp_dir().join("potency-fs-effect-doc");
+/// let manifest = Store::new(CpuStore::new())
+///     .effect(fs_effect(&output, render_frames))
+///     .param("default")
+///     .run()
+///     .await?;
+/// assert_eq!(manifest.file_count, 2);
+///
+/// # let _ = std::fs::remove_dir_all(&output);
+/// # Ok(())
+/// # }
+/// ```
 pub fn fs_effect<P>(output_dir: impl Into<PathBuf>, produce: P) -> FsEffect<P> {
     let output_dir = output_dir.into();
     let staging_dir = staging_path(&output_dir);

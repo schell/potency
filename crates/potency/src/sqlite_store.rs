@@ -35,7 +35,21 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// Open a store.
+    /// Open a store backed by a SQLite database at `path`.
+    ///
+    /// Use `":memory:"` for a per-connection in-memory database (tests), or a
+    /// file path for a persistent store that survives process restarts.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # async fn doc() -> Result<(), potency::sqlite_store::Error> {
+    /// use potency::{sqlite_store::SqliteStore, Store};
+    ///
+    /// let store = Store::new(SqliteStore::open("state.db").await?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn open(path: impl AsRef<std::path::Path>) -> Result<Self, Error> {
         let store = Self {
             connection: Arc::new(async_lock::Mutex::new({

@@ -79,6 +79,28 @@ impl IsStore for CpuStore {
 }
 
 impl CpuStore {
+    /// Create a fresh, empty in-memory store. Mostly useful for tests.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # async fn doc() {
+    /// use potency::{cpu_store::CpuStore, Store};
+    ///
+    /// async fn square(n: u32) -> Result<u32, potency::json::Error> {
+    ///     Ok(n * n)
+    /// }
+    ///
+    /// let store = Store::new(CpuStore::new());
+    /// let v = store
+    ///     .entry_async(square)
+    ///     .param(7u32)
+    ///     .run()
+    ///     .await
+    ///     .unwrap();
+    /// assert_eq!(v, 49);
+    /// # }
+    /// ```
     pub fn new() -> Self {
         Self {
             inner: Default::default(),
