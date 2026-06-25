@@ -477,11 +477,24 @@ dependencies = [
  "async-lock",
  "env_logger",
  "log",
+ "potency-macros",
  "serde",
  "serde_json",
  "smol",
  "snafu",
  "sqlite",
+]
+
+[[package]]
+name = "potency-macros"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "potency",
+ "proc-macro2",
+ "quote",
+ "smol",
+ "syn",
 ]
 
 [[package]]

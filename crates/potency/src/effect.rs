@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Effect, Stored};
+use crate::{Effect, StoreError};
 
 /// A serializable record of a committed directory-producing effect.
 ///
@@ -71,11 +71,26 @@ impl<E> From<std::io::Error> for FsEffectError<E> {
     }
 }
 
-/// A directory-producing [`Effect`].
+/// Bridge `FsEffectError<E>` into `StoreError`.
 ///
-/// Construct via [`fs_effect`]. The `produce` closure receives the staging
-/// directory path and must write its output there, returning the number of
-/// files it wrote (used to build the [`FileManifest`]).
+/// Always defined: the `Io` arm goes via `From<io::Error> for StoreError`,
+/// and the `Produce` arm wraps the inner error in a JSON-shaped error
+/// carrying the display form so any `E: Display` works without requiring
+/// `E: Into<StoreError>`.
+impl<E: std::fmt::Display> From<FsEffectError<E>> for StoreError {
+    fn from(e: FsEffectError<E>) -> Self {
+        match e {
+            FsEffectError::Io(io) => io.into(),
+            FsEffectError::Produce(inner) => StoreError::Json {
+                source: serde_json::Error::io(std::io::Error::other(format!(
+                    "produce failed: {inner}"
+                ))),
+            },
+        }
+    }
+}
+
+/// A directory-producing [`Effect`].
 pub struct FsEffect<P> {
     output_dir: PathBuf,
     staging_dir: PathBuf,
@@ -84,20 +99,12 @@ pub struct FsEffect<P> {
 
 /// Build a directory-producing durable effect.
 ///
-/// - `output_dir` — where the committed files should ultimately live.
-/// - `produce` — an async closure `Fn(&Path) -> Future<Output = Result<u64, E>>`
-///   that writes files into the provided staging directory and returns the
-///   count it wrote.
-///
-/// The staging directory is `output_dir` with `.staging` appended, kept as a
-/// sibling so the commit rename is atomic.
-///
 /// # Examples
 ///
 /// ```rust,no_run
-/// # async fn doc() -> Result<(), potency::EffectError<potency::json::Error, potency::effect::FsEffectError<std::io::Error>>> {
+/// # async fn doc() -> Result<(), potency::EffectError> {
 /// use std::path::PathBuf;
-/// use potency::{cpu_store::CpuStore, effect::fs_effect, Store};
+/// use potency::{effect::fs_effect, Store};
 ///
 /// async fn render_frames(staging: PathBuf) -> Result<u64, std::io::Error> {
 ///     std::fs::write(staging.join("frame_0.png"), b"x")?;
@@ -106,7 +113,8 @@ pub struct FsEffect<P> {
 /// }
 ///
 /// let output = std::env::temp_dir().join("potency-fs-effect-doc");
-/// let manifest = Store::new(CpuStore::new())
+/// let store = Store::in_memory().await?;
+/// let manifest = store
 ///     .effect(fs_effect(&output, render_frames))
 ///     .param("default")
 ///     .run()
@@ -144,14 +152,19 @@ impl<P, Fut, E> Effect for FsEffect<P>
 where
     P: Fn(PathBuf) -> Fut,
     Fut: Future<Output = Result<u64, E>>,
+    E: std::fmt::Display + Send + 'static,
 {
     type Staging = PathBuf;
     type Manifest = FileManifest;
     type Error = FsEffectError<E>;
 
-    fn fresh_staging<'a>(&'a self, _key: &'a str) -> Stored<'a, Self::Staging, Self::Error> {
+    fn fresh_staging<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Self::Staging, Self::Error>> + 'a>,
+    > {
         Box::pin(async move {
-            // Clear any leftover staging from a crashed attempt, then recreate.
             if self.staging_dir.exists() {
                 std::fs::remove_dir_all(&self.staging_dir)?;
             }
@@ -163,7 +176,9 @@ where
     fn produce<'a>(
         &'a self,
         staging: &'a Self::Staging,
-    ) -> Stored<'a, Self::Manifest, Self::Error> {
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Self::Manifest, Self::Error>> + 'a>,
+    > {
         Box::pin(async move {
             let count = (self.produce)(staging.clone())
                 .await
@@ -179,10 +194,8 @@ where
         &'a self,
         staging: &'a Self::Staging,
         _manifest: &'a Self::Manifest,
-    ) -> Stored<'a, (), Self::Error> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + 'a>> {
         Box::pin(async move {
-            // Remove any pre-existing (stale) output dir, then atomically
-            // rename staging into place.
             if self.output_dir.exists() {
                 std::fs::remove_dir_all(&self.output_dir)?;
             }
@@ -194,7 +207,10 @@ where
         })
     }
 
-    fn verify<'a>(&'a self, manifest: &'a Self::Manifest) -> Stored<'a, bool, Self::Error> {
+    fn verify<'a>(
+        &'a self,
+        manifest: &'a Self::Manifest,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<bool, Self::Error>> + 'a>> {
         Box::pin(async move {
             if !manifest.output_dir.is_dir() {
                 return Ok(false);
@@ -209,11 +225,10 @@ mod test {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
-    use crate::{cpu_store::CpuStore, EffectError, Store};
+    use crate::{EffectError, Store};
 
     use super::*;
 
-    /// A test work directory that is cleaned up on drop.
     struct TmpDir(PathBuf);
     impl TmpDir {
         fn new(name: &str) -> Self {
@@ -232,7 +247,10 @@ mod test {
         }
     }
 
-    /// Build a produce closure that writes `n` files and bumps a call counter.
+    async fn open_store() -> Store {
+        Store::in_memory().await.unwrap()
+    }
+
     fn make_produce(
         calls: Arc<AtomicU32>,
         n: u64,
@@ -252,9 +270,8 @@ mod test {
             let tmp = TmpDir::new("hit");
             let out = tmp.path().join("frames_up");
             let calls = Arc::new(AtomicU32::new(0));
-            let store = Store::new(CpuStore::new());
+            let store = open_store().await;
 
-            // First run: miss -> produces.
             let m1 = store
                 .namespace("upscale")
                 .effect(fs_effect(&out, make_produce(calls.clone(), 5)))
@@ -266,7 +283,6 @@ mod test {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(count_files(&out), 5);
 
-            // Second run: verified hit -> NO recompute.
             let m2 = store
                 .namespace("upscale")
                 .effect(fs_effect(&out, make_produce(calls.clone(), 5)))
@@ -285,7 +301,7 @@ mod test {
             let tmp = TmpDir::new("stale");
             let out = tmp.path().join("frames_up");
             let calls = Arc::new(AtomicU32::new(0));
-            let store = Store::new(CpuStore::new());
+            let store = open_store().await;
 
             store
                 .effect(fs_effect(&out, make_produce(calls.clone(), 3)))
@@ -295,10 +311,8 @@ mod test {
                 .unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-            // Simulate the workdir being wiped between runs.
             std::fs::remove_dir_all(&out).unwrap();
 
-            // Cache entry exists, but verify() fails -> recompute.
             store
                 .effect(fs_effect(&out, make_produce(calls.clone(), 3)))
                 .param("k")
@@ -316,7 +330,7 @@ mod test {
             let tmp = TmpDir::new("partial");
             let out = tmp.path().join("frames_up");
             let calls = Arc::new(AtomicU32::new(0));
-            let store = Store::new(CpuStore::new());
+            let store = open_store().await;
 
             store
                 .effect(fs_effect(&out, make_produce(calls.clone(), 4)))
@@ -325,7 +339,6 @@ mod test {
                 .await
                 .unwrap();
 
-            // Corrupt the committed output: remove one file so count != manifest.
             std::fs::remove_file(out.join("000.txt")).unwrap();
             assert_eq!(count_files(&out), 3);
 
@@ -340,20 +353,18 @@ mod test {
         });
     }
 
-    #[cfg(feature = "sqlite-store")]
     #[test]
-    fn effect_durable_with_sqlite_store() {
-        use crate::sqlite_store::SqliteStore;
+    fn effect_durable_with_persistent_store() {
+        use std::path::Path;
         smol::block_on(async {
-            let tmp = TmpDir::new("sqlite");
+            let tmp = TmpDir::new("persistent");
             let db = tmp.path().join("state.db");
             let out = tmp.path().join("frames_up");
             let calls = Arc::new(AtomicU32::new(0));
 
-            // Use a persistent DB file so a fresh Store (simulating a new
-            // process invocation) sees the committed entry.
+            // First process: produce once.
             {
-                let store = Store::new(SqliteStore::open(&db).await.unwrap());
+                let store = Store::open(&db).await.unwrap();
                 store
                     .namespace("upscale")
                     .effect(fs_effect(&out, make_produce(calls.clone(), 6)))
@@ -364,9 +375,9 @@ mod test {
             }
             assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-            // New Store over the same DB: verified hit, no recompute.
+            // Second process over the same DB: verified hit, no recompute.
             {
-                let store = Store::new(SqliteStore::open(&db).await.unwrap());
+                let store = Store::open(&db).await.unwrap();
                 let m = store
                     .namespace("upscale")
                     .effect(fs_effect(&out, make_produce(calls.clone(), 6)))
@@ -381,7 +392,7 @@ mod test {
             // Wipe output -> stale -> recompute (exercises DELETE + re-store).
             std::fs::remove_dir_all(&out).unwrap();
             {
-                let store = Store::new(SqliteStore::open(&db).await.unwrap());
+                let store = Store::open(&db).await.unwrap();
                 store
                     .namespace("upscale")
                     .effect(fs_effect(&out, make_produce(calls.clone(), 6)))
@@ -392,15 +403,13 @@ mod test {
             }
             assert_eq!(calls.load(Ordering::SeqCst), 2, "stale after wipe recomputes");
             assert_eq!(count_files(&out), 6);
+
+            let _ = Path::new(&db);
         });
     }
 
     #[test]
     fn effect_crash_before_store_recomputes_cleanly() {
-        // Simulate a crash AFTER commit but BEFORE the manifest is stored.
-        // Per the invariant, no cache entry exists, so the next run must
-        // recompute cleanly (and the prior committed dir is replaced, not
-        // corrupted).
         smol::block_on(async {
             let tmp = TmpDir::new("crash");
             let out = tmp.path().join("frames_up");
@@ -413,10 +422,8 @@ mod test {
             effect.commit(&staging, &manifest).await.unwrap();
             assert!(out.is_dir());
             assert_eq!(calls.load(Ordering::SeqCst), 1);
-            // (no store call — simulating a crash here)
 
-            // Fresh run with an empty store: cache miss -> recompute, no corruption.
-            let store = Store::new(CpuStore::new());
+            let store = open_store().await;
             let m = store
                 .effect(fs_effect(&out, make_produce(calls.clone(), 2)))
                 .param("k")
@@ -434,10 +441,8 @@ mod test {
         smol::block_on(async {
             let tmp = TmpDir::new("atomic");
             let out = tmp.path().join("frames_up");
-            let store = Store::new(CpuStore::new());
+            let store = open_store().await;
 
-            // produce writes a file then fails: commit must NOT run, so the
-            // final output dir must not exist (work stayed in staging).
             let produce = |staging: PathBuf| {
                 std::fs::write(staging.join("partial.txt"), b"x").unwrap();
                 std::future::ready(Err("boom"))
@@ -448,10 +453,8 @@ mod test {
                 .run()
                 .await;
 
-            assert!(matches!(result, Err(EffectError::Effect(_))));
+            assert!(matches!(result, Err(EffectError::Store(_))));
             assert!(!out.exists(), "final dir must not exist after failed produce");
-            // Staging may exist with the partial file; it is cleared on the
-            // next attempt's fresh_staging.
             assert!(staging_path(&out).join("partial.txt").exists());
         });
     }

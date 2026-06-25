@@ -23,15 +23,16 @@
 //!   returns it.
 //!
 //! That contract is the whole library. Everything else — sync vs async,
-//! in-memory vs SQLite, plain values vs side-effects — is variation on top.
+//! in-memory vs file-backed, plain values vs side-effects — is variation on
+//! top.
 //!
 //! ## 2. Multi-color support (sync and async)
 //!
 //! `potency` works with both sync and async functions. You choose the
 //! entry-point that matches your work:
 //!
-//! - [`crate::Store::entry`] for a plain `fn(...) -> T`.
-//! - [`crate::Store::entry_async`] for an `async fn(...) -> impl Future<Output = T>`.
+//! - [`crate::Store::entry`] for a plain `fn(...) -> Result<T, E>`.
+//! - [`crate::Store::entry_async`] for an `async fn(...) -> Result<T, E>`.
 //!
 //! Both produce the same [`crate::Builder`], with the same keying and caching
 //! behavior.
@@ -41,17 +42,18 @@
 //! > plain sync function. Multi-color describes the *work*, not the runtime.
 //!
 //! ```rust
-//! # async fn doc() {
-//! use potency::{cpu_store::CpuStore, Store};
+//! # async fn doc() -> Result<(), potency::StoreError> {
+//! use potency::Store;
 //!
 //! // Sync work, async API.
-//! fn add(a: u32, b: u32) -> Result<u32, potency::json::Error> {
+//! fn add(a: u32, b: u32) -> Result<u32, potency::StoreError> {
 //!     Ok(a + b)
 //! }
 //!
-//! let store = Store::new(CpuStore::new());
-//! let sum = store.entry(add).param(2u32).param(3u32).run().await.unwrap();
+//! let store = Store::in_memory().await?;
+//! let sum = store.entry(add).param(2u32).param(3u32).run().await?;
 //! assert_eq!(sum, 5);
+//! # Ok(())
 //! # }
 //! ```
 //!
@@ -61,14 +63,14 @@
 //! function.
 //!
 //! ```rust
-//! # async fn doc() {
-//! use potency::{cpu_store::CpuStore, Store};
+//! # async fn doc() -> Result<(), potency::StoreError> {
+//! use potency::Store;
 //!
-//! async fn three(a: u32, b: u32, c: u32) -> Result<u32, potency::json::Error> {
+//! async fn three(a: u32, b: u32, c: u32) -> Result<u32, potency::StoreError> {
 //!     Ok(a + b + c)
 //! }
 //!
-//! let store = Store::new(CpuStore::new());
+//! let store = Store::in_memory().await?;
 //!
 //! let n = store
 //!     .namespace("quickstart")
@@ -77,8 +79,7 @@
 //!     .param(2u32)
 //!     .param(3u32)
 //!     .run()
-//!     .await
-//!     .unwrap();
+//!     .await?;
 //!
 //! assert_eq!(n, 6);
 //!
@@ -90,9 +91,9 @@
 //!     .param(2u32)
 //!     .param(3u32)
 //!     .run()
-//!     .await
-//!     .unwrap();
+//!     .await?;
 //! assert_eq!(n, 6);
+//! # Ok(())
 //! # }
 //! ```
 //!
@@ -109,20 +110,21 @@
 //! should *change* the answer.
 //!
 //! ```rust
-//! # async fn doc() {
-//! use potency::{cpu_store::CpuStore, Store};
+//! # async fn doc() -> Result<(), potency::StoreError> {
+//! use potency::Store;
 //!
-//! async fn greet(name: String) -> Result<String, potency::json::Error> {
+//! async fn greet(name: String) -> Result<String, potency::StoreError> {
 //!     Ok(format!("hello, {name}"))
 //! }
 //!
-//! let store = Store::new(CpuStore::new());
+//! let store = Store::in_memory().await?;
 //!
-//! let a = store.namespace("greet").entry_async(greet).param("alice".to_string()).run().await.unwrap();
-//! let b = store.namespace("greet").entry_async(greet).param("bob".to_string()).run().await.unwrap();
+//! let a = store.namespace("greet").entry_async(greet).param("alice".to_string()).run().await?;
+//! let b = store.namespace("greet").entry_async(greet).param("bob".to_string()).run().await?;
 //!
 //! assert_eq!(a, "hello, alice");
 //! assert_eq!(b, "hello, bob");
+//! # Ok(())
 //! # }
 //! ```
 //!
@@ -153,36 +155,32 @@
 //! assert_eq!(id.as_key(), "user:42");
 //! ```
 //!
-//! ## 6. Backing stores
+//! ## 6. Storage
 //!
-//! The `Store<S>` is generic over a backing store. The whole library is
-//! runtime-agnostic — the choice of store is independent of the choice of
-//! sync vs async for the work.
-//!
-//! For tests and small in-process use:
+//! `potency` is SQLite-backed. Pass `":memory:"` for an in-memory store (tests
+//! and short-lived processes) or a file path for a persistent store that
+//! survives process restarts.
 //!
 //! ```rust
-//! # async fn doc() {
-//! use potency::{cpu_store::CpuStore, Store};
+//! # async fn doc() -> Result<(), potency::StoreError> {
+//! use potency::Store;
 //!
-//! let store = Store::new(CpuStore::new());
+//! let store = Store::in_memory().await?;
 //! # let _ = store;
-//! # }
-//! ```
-//!
-//! For persistence across runs, use the SQLite store. (`Cargo.toml`: enable
-//! the `sqlite-store` feature.)
-//!
-//! ```rust,no_run
-//! # async fn doc() -> Result<(), potency::sqlite_store::Error> {
-//! use potency::{sqlite_store::SqliteStore, Store};
-//!
-//! let store = Store::new(SqliteStore::open("state.db").await?);
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! The two are interchangeable at every call site — only `Store::new` differs.
+//! ```rust,no_run
+//! # async fn doc() -> Result<(), potency::StoreError> {
+//! use potency::Store;
+//!
+//! let store = Store::open("state.db").await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The only difference is whether the cache outlives the process.
 //!
 //! ## 7. Durable side-effects (`Effect`)
 //!
@@ -199,19 +197,19 @@
 //! against the filesystem; if the output is still there, the work is skipped.
 //!
 //! ```rust,no_run
-//! # async fn doc() -> Result<(), potency::EffectError<potency::json::Error, potency::effect::FsEffectError<std::io::Error>>> {
+//! # async fn doc() -> Result<(), potency::EffectError> {
 //! use std::path::PathBuf;
-//! use potency::{cpu_store::CpuStore, effect::fs_effect, Store};
+//! use potency::{effect::fs_effect, Store};
 //!
 //! async fn render_frames(staging: PathBuf) -> Result<u64, std::io::Error> {
 //!     // Pretend we just rendered 3 frames into `staging`.
 //!     for i in 0..3 {
-//!         std::fs::write(staging.join(format!("{i:03}.png")), b"frame").unwrap();
+//!         std::fs::write(staging.join(format!("{i:03}.png")), b"frame")?;
 //!     }
 //!     Ok(3)
 //! }
 //!
-//! let store = Store::new(CpuStore::new());
+//! let store = Store::in_memory().await?;
 //! let output = std::env::temp_dir().join("potency-doc-out");
 //!
 //! // First run: produces 3 frames.
@@ -257,3 +255,33 @@
 //! - [`crate::Builder`] — composing a durable call.
 //! - [`crate::Effect`] / [`crate::effect::fs_effect`] — durable side-effects.
 //! - [`crate::AsKey`] — turning parameters into keys.
+//!
+//! ## 10. The `#[durable]` macro (optional)
+//!
+//! The optional companion crate [`potency-macros`](https://docs.rs/potency-macros)
+//! provides a `#[durable]` attribute that turns a function into its own
+//! cached wrapper:
+//!
+//! ```rust,ignore
+//! use potency::{install_global_store, Store, StoreError};
+//! use potency_macros::durable;
+//!
+//! #[durable(namespace = "users")]
+//! async fn fetch_user(id: u64) -> Result<String, StoreError> {
+//!     Ok(format!("user-{id}"))
+//! }
+//!
+//! // The original `fetch_user` is emitted verbatim (still callable directly).
+//! // `durable_fetch_user` is the cached wrapper.
+//! ```
+//!
+//! At startup:
+//!
+//! ```rust,ignore
+//! install_global_store(Store::in_memory().await?).unwrap();
+//! let user = durable_fetch_user(42).await?;
+//! ```
+//!
+//! The wrapper is always `async` regardless of whether the original was
+//! sync or async. If `namespace` is omitted, the function's identifier is
+//! used.
