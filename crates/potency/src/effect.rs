@@ -161,9 +161,7 @@ where
     fn fresh_staging<'a>(
         &'a self,
         _key: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<Self::Staging, Self::Error>> + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Self::Staging, Self::Error>> + 'a>> {
         Box::pin(async move {
             if self.staging_dir.exists() {
                 std::fs::remove_dir_all(&self.staging_dir)?;
@@ -176,9 +174,7 @@ where
     fn produce<'a>(
         &'a self,
         staging: &'a Self::Staging,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<Self::Manifest, Self::Error>> + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Self::Manifest, Self::Error>> + 'a>> {
         Box::pin(async move {
             let count = (self.produce)(staging.clone())
                 .await
@@ -291,7 +287,11 @@ mod test {
                 .await
                 .unwrap();
             assert_eq!(m2, m1);
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "should not recompute on hit");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "should not recompute on hit"
+            );
         });
     }
 
@@ -319,7 +319,11 @@ mod test {
                 .run()
                 .await
                 .unwrap();
-            assert_eq!(calls.load(Ordering::SeqCst), 2, "stale entry must recompute");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "stale entry must recompute"
+            );
             assert_eq!(count_files(&out), 3);
         });
     }
@@ -348,7 +352,11 @@ mod test {
                 .run()
                 .await
                 .unwrap();
-            assert_eq!(calls.load(Ordering::SeqCst), 2, "count mismatch must recompute");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "count mismatch must recompute"
+            );
             assert_eq!(count_files(&out), 4);
         });
     }
@@ -387,7 +395,11 @@ mod test {
                     .unwrap();
                 assert_eq!(m.file_count, 6);
             }
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "persisted hit, no recompute");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "persisted hit, no recompute"
+            );
 
             // Wipe output -> stale -> recompute (exercises DELETE + re-store).
             std::fs::remove_dir_all(&out).unwrap();
@@ -401,7 +413,11 @@ mod test {
                     .await
                     .unwrap();
             }
-            assert_eq!(calls.load(Ordering::SeqCst), 2, "stale after wipe recomputes");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "stale after wipe recomputes"
+            );
             assert_eq!(count_files(&out), 6);
 
             let _ = Path::new(&db);
@@ -454,7 +470,10 @@ mod test {
                 .await;
 
             assert!(matches!(result, Err(EffectError::Store(_))));
-            assert!(!out.exists(), "final dir must not exist after failed produce");
+            assert!(
+                !out.exists(),
+                "final dir must not exist after failed produce"
+            );
             assert!(staging_path(&out).join("partial.txt").exists());
         });
     }

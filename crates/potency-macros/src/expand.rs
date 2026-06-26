@@ -4,8 +4,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
     parse::{Parse, ParseStream},
-    parse2,
-    FnArg, ItemFn, LitStr, Result, ReturnType, Signature, Token,
+    parse2, FnArg, ItemFn, LitStr, Result, ReturnType, Signature, Token,
 };
 
 /// `#[durable]` or `#[durable(namespace = "...")]`.
@@ -28,11 +27,13 @@ impl Parse for DurableAttr {
         let _eq: Token![=] = input.parse()?;
         let namespace: LitStr = input.parse()?;
         if !input.is_empty() {
-            return Err(input.error(
-                "#[durable] only accepts a single `namespace = \"...\"` argument",
-            ));
+            return Err(
+                input.error("#[durable] only accepts a single `namespace = \"...\"` argument")
+            );
         }
-        Ok(Self { namespace: Some(namespace) })
+        Ok(Self {
+            namespace: Some(namespace),
+        })
     }
 }
 

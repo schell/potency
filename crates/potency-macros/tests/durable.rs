@@ -65,9 +65,9 @@ async fn slow_add(a: u32, b: u32) -> Result<u32, StoreError> {
 fn async_durable_runs_through_potency() {
     install_shared_store();
     smol::block_on(async {
-        let n = slow_add(7, 8).await.unwrap();
+        let n = durable_slow_add(7, 8).await.unwrap();
         assert_eq!(n, 15);
-        let n = slow_add(7, 8).await.unwrap();
+        let n = durable_slow_add(7, 8).await.unwrap();
         assert_eq!(n, 15);
     });
 }
@@ -114,3 +114,65 @@ fn original_is_emitted_verbatim() {
 // trybuild compile-fail tests would live here; we use plain assertions
 // instead since `trybuild` isn't a dev-dep.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Nesting: `#[durable]` wrappers can call other `#[durable]` wrappers (or
+// each other) without deadlocking. Pre lock-drop, this would deadlock on
+// the SQLite connection mutex.
+// ---------------------------------------------------------------------------
+
+#[durable(namespace = "nest-inner")]
+fn double(x: u32) -> Result<u32, StoreError> {
+    Ok(x * 2)
+}
+
+#[durable(namespace = "nest-outer")]
+async fn double_plus_one(x: u32) -> Result<u32, StoreError> {
+    // Call another `#[durable]` wrapper from inside this one. Each
+    // `#[durable]` carries its own namespace, so cache keys don't collide.
+    let y = durable_double(x).await?;
+    Ok(y + 1)
+}
+
+#[test]
+fn macro_nested_durable_calls() {
+    install_shared_store();
+    smol::block_on(async {
+        let n = durable_double_plus_one(10).await.unwrap();
+        assert_eq!(n, 21); // (10 * 2) + 1
+
+        // Second call: outer hits cache.
+        let n = durable_double_plus_one(10).await.unwrap();
+        assert_eq!(n, 21);
+    });
+}
+
+#[durable(namespace = "nest-async-outer")]
+async fn chain_step_a(x: u32) -> Result<u32, StoreError> {
+    Ok(x + 1)
+}
+
+#[durable(namespace = "nest-async-mid")]
+async fn chain_step_b(x: u32) -> Result<u32, StoreError> {
+    let y = durable_chain_step_a(x).await?;
+    Ok(y * 3)
+}
+
+#[durable(namespace = "nest-async-top")]
+async fn chain_top(x: u32) -> Result<u32, StoreError> {
+    let y = durable_chain_step_b(x).await?;
+    Ok(y + 100)
+}
+
+#[test]
+fn macro_deeply_nested_durable_calls() {
+    install_shared_store();
+    smol::block_on(async {
+        // a(5) = 6, b(5) = 6 * 3 = 18, top(5) = 18 + 100 = 118.
+        let n = durable_chain_top(5).await.unwrap();
+        assert_eq!(n, 118);
+
+        let n = durable_chain_top(5).await.unwrap();
+        assert_eq!(n, 118);
+    });
+}

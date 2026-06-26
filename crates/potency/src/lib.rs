@@ -145,6 +145,16 @@ where
     O: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + 'static,
     E: Into<StoreError> + Send + 'static,
 {
+    /// Run the cached call.
+    ///
+    /// The cache key is `key.join(",")` — i.e. the namespace segments (added
+    /// via [`Store::namespace`] on the originating [`Store`]) followed by the
+    /// `.param(...)` arguments. Two entries share a cache slot iff their
+    /// joined keys are equal.
+    ///
+    /// **Nesting.** The user's function runs *without* the SQLite connection
+    /// lock held, so a durable call may freely invoke other durable calls
+    /// (including recursively) without deadlocking.
     pub async fn run(self) -> Result<O, StoreError> {
         let Self {
             store,
@@ -195,6 +205,17 @@ impl Store {
     /// `f` must return `Result<O, E>` where `E: Into<StoreError>`. On a miss
     /// the `Ok` value is serialized and stored; on `Err` the value is
     /// returned to the caller and **not** stored.
+    ///
+    /// **Locking.** The SQLite connection is locked only for the brief
+    /// fetch/store round-trips. The user's function `f` runs *without* the
+    /// lock held, so a durable call may invoke other durable calls (or
+    /// recurse) without deadlocking.
+    ///
+    /// **Concurrent same-key misses.** Two tasks that miss the same key
+    /// concurrently will both compute; the second writer, on re-acquiring
+    /// the lock, observes the first writer's stored value and returns it
+    /// instead of overwriting. The cost is one redundant compute per pair;
+    /// the observable result is the same for any deterministic function.
     fn fetch_or_else<'a, O, E, Fut>(
         &'a self,
         key: impl AsRef<str> + 'a,
@@ -207,19 +228,32 @@ impl Store {
     {
         let full_key = key.as_ref().to_owned();
         Box::pin(async move {
-            let mut lock = self.inner.lock().await;
-            let maybe_value: Option<serde_json::Value> = fetch_value(&mut lock, &full_key).await?;
+            // Step 1: brief lock to fetch.
+            let maybe_value: Option<serde_json::Value> = {
+                let mut lock = self.inner.lock().await;
+                fetch_value(&mut lock, &full_key).await?
+            };
             if let Some(json_value) = maybe_value {
                 log::trace!("{full_key:?} is cached, returning cache hit");
                 let output: O = serde_json::from_value(json_value)?;
-                Ok(output)
-            } else {
-                log::trace!("{full_key:?} is not cached, computing the value");
-                let output = f().await.map_err(Into::into)?;
-                let json_value = serde_json::to_value(output.clone())?;
-                store_value(&mut lock, &full_key, &json_value).await?;
-                Ok(output)
+                return Ok(output);
             }
+            log::trace!("{full_key:?} is not cached, computing the value");
+
+            // Step 2: user work — NO LOCK held. This is what makes
+            // durable-in-durable and recursive durable calls safe.
+            let output = f().await.map_err(Into::into)?;
+
+            // Step 3: brief lock to store, with re-check for racing writers.
+            let mut lock = self.inner.lock().await;
+            if let Some(existing) = fetch_value(&mut lock, &full_key).await? {
+                log::trace!("{full_key:?} racing writer detected, using their value");
+                let output: O = serde_json::from_value(existing)?;
+                return Ok(output);
+            }
+            let json_value = serde_json::to_value(output.clone())?;
+            store_value(&mut lock, &full_key, &json_value).await?;
+            Ok(output)
         })
     }
 
@@ -238,7 +272,10 @@ impl Store {
         let fn_pair: FnPair<(), F, Sync> = FnPair { f, _input };
         Builder {
             store: self,
-            key: vec![],
+            // Inherit the Store's accumulated namespace segments so the
+            // resulting cache key reflects both the namespace and the
+            // params added via `.param(...)`.
+            key: self.key.clone(),
             input: (),
             fn_pair,
         }
@@ -248,7 +285,7 @@ impl Store {
     pub fn entry_async<F>(&self, f: F) -> Builder<'_, (), F, Async> {
         Builder {
             store: self,
-            key: vec![],
+            key: self.key.clone(),
             input: (),
             fn_pair: FnPair {
                 f,
@@ -424,18 +461,36 @@ where
     E: Effect<Error = Err>,
     Err: Into<StoreError>,
 {
+    /// Run the durable effect protocol.
+    ///
+    /// - **Hit + valid:** returns the cached manifest, performing no work.
+    /// - **Hit + stale:** deletes the entry and re-runs.
+    /// - **Miss:** stages, produces, commits, then records the manifest.
+    ///
+    /// **Nesting.** The `fresh_staging` / `produce` / `commit` phase runs
+    /// *without* the SQLite connection lock held, so an `Effect`'s
+    /// filesystem work can include nested durable calls (or other
+    /// effects) without deadlocking. Note that two `Effect` runs sharing
+    /// the same cache key from *different tasks* would still race on the
+    /// staging directory; this design supports nesting in a single task,
+    /// not concurrent same-key runs across tasks.
     pub async fn run(self) -> Result<E::Manifest, EffectError> {
         let Self { store, key, effect } = self;
         let full_key = key.join(",");
-        let mut lock = store.inner.lock().await;
 
-        // 1. Check the cache.
-        let cached: Option<serde_json::Value> = fetch_value(&mut lock, &full_key)
-            .await
-            .map_err(EffectError::Store)?;
+        // Step 1: brief lock to fetch.
+        let cached: Option<serde_json::Value> = {
+            let mut lock = store.inner.lock().await;
+            fetch_value(&mut lock, &full_key)
+                .await
+                .map_err(EffectError::Store)?
+        };
+
         if let Some(json_value) = cached {
             let manifest: E::Manifest = serde_json::from_value(json_value)
                 .map_err(|e| EffectError::Store(StoreError::Json { source: e }))?;
+
+            // Step 2: verify outside the lock — verify is filesystem-only.
             if effect
                 .verify(&manifest)
                 .await
@@ -444,13 +499,17 @@ where
                 log::trace!("{full_key:?} effect cache hit (verified)");
                 return Ok(manifest);
             }
+            // Stale: brief lock to delete the entry.
             log::trace!("{full_key:?} effect cache stale; invalidating");
+            let mut lock = store.inner.lock().await;
             delete_value(&mut lock, &full_key)
                 .await
                 .map_err(EffectError::Store)?;
         }
 
-        // 2. Miss (or invalidated): stage -> produce -> commit -> record.
+        // Step 3: filesystem work — NO LOCK held. This allows effects to
+        // themselves be invoked from inside another durable call without
+        // deadlocking on the SQLite connection.
         log::trace!("{full_key:?} effect computing");
         let staging = effect
             .fresh_staging(&full_key)
@@ -465,13 +524,305 @@ where
             .await
             .map_err(|e| EffectError::Store(e.into()))?;
 
-        // 3. Only now record the manifest: entry exists iff committed.
+        // Step 4: brief lock to store the manifest.
+        let mut lock = store.inner.lock().await;
         let json_value = serde_json::to_value(manifest.clone())
             .map_err(|e| EffectError::Store(StoreError::Json { source: e }))?;
         store_value(&mut lock, &full_key, &json_value)
             .await
             .map_err(EffectError::Store)?;
         Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for nesting and reentrancy. These exercise the lock-dropping
+    //! changes in `fetch_or_else` and `EffectBuilder::run`.
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// A simple counter so tests can assert "the function body ran N times."
+    #[derive(Clone, Default)]
+    struct Counter(Arc<AtomicU32>);
+
+    impl Counter {
+        fn bump(&self) -> u32 {
+            self.0.fetch_add(1, Ordering::SeqCst) + 1
+        }
+        fn get(&self) -> u32 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Sync entry nested inside an async entry. Pre-lock-drop this would
+    /// deadlock the SQLite connection.
+    #[test]
+    fn nesting_sync_inside_async() {
+        smol::block_on(async {
+            let store = Store::in_memory().await.unwrap();
+            let inner_calls = Counter::default();
+            let outer_calls = Counter::default();
+
+            // First call: outer miss + inner miss. Both bodies run.
+            {
+                let store_for_call = store.clone();
+                let store_for_closure = store_for_call.clone();
+                let outer_calls_clone = outer_calls.clone();
+                let inner_calls_clone = inner_calls.clone();
+                let outer = move |x: u32| {
+                    let outer_calls = outer_calls_clone.clone();
+                    let inner_calls = inner_calls_clone.clone();
+                    let store = store_for_closure.clone();
+                    async move {
+                        let _ = outer_calls.bump();
+                        // Use a distinct namespace for the inner entry so its
+                        // cache key doesn't collide with the outer's. Two
+                        // entries sharing the same key would race in the
+                        // re-check step.
+                        let y = store
+                            .namespace("inner")
+                            .entry(move |x: u32| -> Result<u32, StoreError> {
+                                let _ = inner_calls.bump();
+                                Ok(x * 2)
+                            })
+                            .param(x)
+                            .run()
+                            .await?;
+                        Ok::<u32, StoreError>(y + 1)
+                    }
+                };
+                let n = store_for_call
+                    .entry_async(outer)
+                    .param(7u32)
+                    .run()
+                    .await
+                    .unwrap();
+                assert_eq!(n, 15); // (7 * 2) + 1
+                assert_eq!(outer_calls.get(), 1);
+                assert_eq!(inner_calls.get(), 1);
+            }
+
+            // Second call: outer hit, no inner body.
+            {
+                let store_for_call = store.clone();
+                let store_for_closure = store_for_call.clone();
+                let outer_calls_clone = outer_calls.clone();
+                let inner_calls_clone = inner_calls.clone();
+                let outer = move |x: u32| {
+                    let outer_calls = outer_calls_clone.clone();
+                    let inner_calls = inner_calls_clone.clone();
+                    let store = store_for_closure.clone();
+                    async move {
+                        let _ = outer_calls.bump();
+                        let y = store
+                            .namespace("inner")
+                            .entry(move |x: u32| -> Result<u32, StoreError> {
+                                let _ = inner_calls.bump();
+                                Ok(x * 2)
+                            })
+                            .param(x)
+                            .run()
+                            .await?;
+                        Ok::<u32, StoreError>(y + 1)
+                    }
+                };
+                let n = store_for_call
+                    .entry_async(outer)
+                    .param(7u32)
+                    .run()
+                    .await
+                    .unwrap();
+                assert_eq!(n, 15);
+                assert_eq!(outer_calls.get(), 1, "outer body should not re-run");
+                assert_eq!(inner_calls.get(), 1, "inner body should not re-run");
+            }
+        });
+    }
+
+    /// Async entry nested inside an async entry.
+    #[test]
+    fn nesting_async_inside_async() {
+        smol::block_on(async {
+            let store = Store::in_memory().await.unwrap();
+            let outer_calls = Counter::default();
+
+            let store_for_call = store.clone();
+            let store_for_closure = store_for_call.clone();
+            let outer_calls_clone = outer_calls.clone();
+            let outer = move |x: u32| {
+                let outer_calls = outer_calls_clone.clone();
+                let store = store_for_closure.clone();
+                async move {
+                    let _ = outer_calls.bump();
+                    let y = store
+                        .namespace("inner")
+                        .entry_async(|n: u32| async move { Ok::<u32, StoreError>(n * 3) })
+                        .param(x)
+                        .run()
+                        .await?;
+                    Ok::<u32, StoreError>(y + 5)
+                }
+            };
+            let n = store_for_call
+                .entry_async(outer)
+                .param(4u32)
+                .run()
+                .await
+                .unwrap();
+            assert_eq!(n, 17); // (4 * 3) + 5
+            assert_eq!(outer_calls.get(), 1);
+        });
+    }
+
+    /// Recursive durable call: an async entry's body contains another async
+    /// entry. Pre lock-drop this would deadlock; with the lock-drop fix
+    /// both calls run.
+    #[test]
+    fn recursive_durable_call() {
+        smol::block_on(async {
+            let store = Store::in_memory().await.unwrap();
+            let outer_calls = Counter::default();
+
+            // Plain recursive factorial (no potency).
+            fn plain_fact(n: u32) -> u32 {
+                if n <= 1 {
+                    1
+                } else {
+                    n * plain_fact(n - 1)
+                }
+            }
+
+            // First call.
+            {
+                let store_for_call = store.clone();
+                let store_for_closure = store_for_call.clone();
+                let outer_calls_clone = outer_calls.clone();
+                let outer = move |n: u32| {
+                    let outer_calls = outer_calls_clone.clone();
+                    let store = store_for_closure.clone();
+                    async move {
+                        let _ = outer_calls.bump();
+                        let f = plain_fact(n);
+                        let g = store
+                            .namespace("inner-fact")
+                            .entry_async(|m: u32| async move { Ok::<u32, StoreError>(m * 100) })
+                            .param(n)
+                            .run()
+                            .await?;
+                        Ok::<u32, StoreError>(f + g)
+                    }
+                };
+                let n = store_for_call
+                    .entry_async(outer)
+                    .param(5u32)
+                    .run()
+                    .await
+                    .unwrap();
+                assert_eq!(n, 620); // 5! + 5*100
+            }
+
+            // Second call (cache hit on outer).
+            {
+                let store_for_call = store.clone();
+                let store_for_closure = store_for_call.clone();
+                let outer_calls_clone = outer_calls.clone();
+                let outer = move |n: u32| {
+                    let outer_calls = outer_calls_clone.clone();
+                    let store = store_for_closure.clone();
+                    async move {
+                        let _ = outer_calls.bump();
+                        let f = plain_fact(n);
+                        let g = store
+                            .namespace("inner-fact")
+                            .entry_async(|m: u32| async move { Ok::<u32, StoreError>(m * 100) })
+                            .param(n)
+                            .run()
+                            .await?;
+                        Ok::<u32, StoreError>(f + g)
+                    }
+                };
+                let n = store_for_call
+                    .entry_async(outer)
+                    .param(5u32)
+                    .run()
+                    .await
+                    .unwrap();
+                assert_eq!(n, 620);
+            }
+            assert_eq!(
+                outer_calls.get(),
+                1,
+                "outer body should not re-run on cache hit"
+            );
+        });
+    }
+
+    /// Two concurrent tasks hitting the same key. Both miss, both compute;
+    /// one wins the store race, the other observes the winner's value via
+    /// re-check. The observable result is consistent across both tasks.
+    #[test]
+    fn concurrent_same_key_consistent() {
+        use std::sync::Barrier;
+
+        let store = smol::block_on(Store::in_memory()).unwrap();
+        let calls = Counter::default();
+
+        // Two threads, each running its own smol block_on. They share the
+        // store (it's Clone — just an Arc<Mutex<Connection>>).
+        let barrier = Arc::new(Barrier::new(2));
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let h1 = std::thread::spawn(move || {
+            smol::block_on(async move {
+                b1.wait();
+                s1.entry_async(move |x: u32| {
+                    let calls = c1.clone();
+                    async move {
+                        smol::Timer::after(std::time::Duration::from_millis(5)).await;
+                        let _ = calls.bump();
+                        Ok::<u32, StoreError>(x * 10)
+                    }
+                })
+                .param(3u32)
+                .run()
+                .await
+            })
+        });
+        let h2 = std::thread::spawn(move || {
+            smol::block_on(async move {
+                b2.wait();
+                s2.entry_async(move |x: u32| {
+                    let calls = c2.clone();
+                    async move {
+                        smol::Timer::after(std::time::Duration::from_millis(5)).await;
+                        let _ = calls.bump();
+                        Ok::<u32, StoreError>(x * 10)
+                    }
+                })
+                .param(3u32)
+                .run()
+                .await
+            })
+        });
+        let v1 = h1.join().unwrap().unwrap();
+        let v2 = h2.join().unwrap().unwrap();
+
+        // Both must observe the same value.
+        assert_eq!(v1, v2);
+        assert_eq!(v1, 30);
+
+        // At most two compute passes; the re-check should not produce a
+        // third.
+        let n = calls.get();
+        assert!((1..=2).contains(&n), "unexpected compute count {n}");
     }
 }
 // (debug tests removed)

@@ -285,3 +285,26 @@
 //! The wrapper is always `async` regardless of whether the original was
 //! sync or async. If `namespace` is omitted, the function's identifier is
 //! used.
+//!
+//! ### Nesting
+//!
+//! `#[durable]` wrappers can call other `#[durable]` wrappers, including
+//! transitively, without deadlocking. Each wrapper carries its own
+//! `namespace` (derived from its function name when not specified), so
+//! distinct wrappers don't share cache keys:
+//!
+//! ```rust,ignore
+//! #[durable] // namespace defaults to "fetch_user"
+//! async fn fetch_user(id: u64) -> Result<User, StoreError> { /* ... */ }
+//!
+//! #[durable] // namespace defaults to "render_user_avatar"
+//! async fn render_user_avatar(id: u64) -> Result<Vec<u8>, StoreError> {
+//!     let user = durable_fetch_user(id).await?;
+//!     // ... use `user` ...
+//! }
+//! ```
+//!
+//! If you call two `#[durable]` wrappers manually with the same namespace
+//! and the same parameter values, you'll share a cache key — that's fine in
+//! principle (both intend the same answer) but the re-check step may
+//! produce surprising results. Prefer distinct namespaces.
